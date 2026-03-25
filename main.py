@@ -70,8 +70,18 @@ def load_qdrant():
 
 def retrieve_chunks(query: str, k: int = 5) -> str:
     vec = get_embedding(query)
-    hits = qdrant_client.search(collection_name=COLLECTION, query_vector=vec, limit=k)
-    return "\n---\n".join([hit.payload.get("text", "") for hit in hits])
+    # NEW: Use query_points instead of the old .search
+    results = qdrant_client.query_points(
+        collection_name=COLLECTION,
+        query=vec,           # just pass the vector list
+        limit=k
+    )
+    # Extract the text from the returned points
+    texts = []
+    for point in results.points:
+        text = point.payload.get("text", "") if point.payload else ""
+        texts.append(text)
+    return "\n---\n".join(texts)
 
 class ChatRequest(BaseModel):
     cuit: str

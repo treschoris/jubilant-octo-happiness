@@ -10,8 +10,8 @@ from supabase import create_client, Client
 
 # ==================== CONFIG ====================
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")      # Use your anon/public key for now
-APP_URL = os.getenv("APP_URL", "https://jubilant-octo-happiness.onrender.com")  # ← your current Render URL
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+APP_URL = os.getenv("APP_URL", "https://jubilant-octo-happiness.onrender.com")
 
 app = FastAPI(title="miboga - Tu boga digital para el BCRA")
 
@@ -24,29 +24,38 @@ def startup():
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
         print("✅ Supabase connected - miboga ready")
     else:
-        print("⚠️  Supabase env vars missing - DB disabled for now")
+        print("⚠️ Supabase env vars missing")
 
-# ==================== BCRA SAFE LOOKUP (prueba de fuego) ====================
+# ==================== BCRA LOOKUP (more robust) ====================
 def normalize_identificacion(ident: str) -> str:
     cleaned = re.sub(r"\D", "", ident)
-    if len(cleaned) != 11 and len(cleaned) != 8:  # allow both CUIT (11) and DNI (8)
+    if len(cleaned) not in (8, 11):
         raise ValueError("El DNI o CUIT debe tener 8 o 11 dígitos")
     return cleaned
 
 async def get_bcra_data(identificacion: str) -> Dict:
+    print(f"🔍 Consultando BCRA para: {identificacion}")
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            # 1. Main Deudas endpoint (most important)
             deudas_resp = await client.get(
                 f"https://api.bcra.gob.ar/centraldedeudores/v1.0/Deudas/{identificacion}"
             )
             deudas_resp.raise_for_status()
             deudas = deudas_resp.json()
 
-            cheques_resp = await client.get(
-                f"https://api.bcra.gob.ar/centraldedeudores/v1.0/ChequesRechazados/{identificacion}"
-            )
-            cheques = cheques_resp.json() if cheques_resp.status_code == 200 else {}
+            # 2. Cheques endpoint (optional - often fails)
+            cheques = {}
+            try:
+                cheques_resp = await client.get(
+                    f"https://api.bcra.gob.ar/centraldedeudores/v1.0/ChequesRechazados/{identificacion}"
+                )
+                if cheques_resp.status_code == 200:
+                    cheques = cheques_resp.json()
+            except Exception:
+                pass  # ignore if this one fails
 
+        print(f"✅ BCRA success for {identificacion}")
         return {
             "status": "success",
             "identificacion": identificacion,
@@ -56,21 +65,23 @@ async def get_bcra_data(identificacion: str) -> Dict:
         }
 
     except httpx.HTTPStatusError as e:
+        print(f"BCRA HTTP error {e.response.status_code} for {identificacion}")
         if e.response.status_code == 404:
             return {"status": "no_history", "message": "No existe historial crediticio aún"}
-        raise
+        return {"status": "error", "message": f"HTTP {e.response.status_code}"}
     except httpx.TimeoutException:
-        return {"status": "bcra_down", "message": "El BCRA está lento o en mantenimiento"}
+        print("BCRA timeout")
+        return {"status": "bcra_down", "message": "Timeout - BCRA lento"}
     except Exception as e:
-        print(f"BCRA error: {e}")
-        return {"status": "error", "message": "No pudimos conectar con el BCRA"}
+        print(f"BCRA connection error: {str(e)}")
+        return {"status": "error", "message": str(e)}
 
 # ==================== REQUEST MODEL ====================
 class ChatRequest(BaseModel):
-    identificacion: str        # DNI or CUIT
-    channel: str = "web"       # "web" or "whatsapp" (future)
+    identificacion: str
+    channel: str = "web"
 
-# ==================== MAIN CHAT ENDPOINT ====================
+# ==================== CHAT ENDPOINT ====================
 @app.post("/chat")
 async def chat(req: ChatRequest):
     try:
@@ -80,59 +91,50 @@ async def chat(req: ChatRequest):
 
     bcra_data = await get_bcra_data(ident)
 
-    # Extract situation safely
+    # Safe situation extraction
     if bcra_data.get("status") == "success":
         try:
             situacion = bcra_data["deudas"]["results"]["periodos"][0]["entidades"][0]["situacion"]
-        except (KeyError, IndexError, TypeError):
+        except Exception:
             situacion = 0
     else:
         situacion = 0
 
-    # ==================== BOGA CRIOLLO RESPONSES ====================
+    # ==================== BOGA RESPONSES ====================
     if bcra_data.get("status") == "success":
         response_text = f"""🇦🇷 Che, ya consulté tu situación en el BCRA.
 
 Tu situación actual es **{situacion}**.
 
-Mirá, esto significa que { "estás al día y todo en orden" if situacion == 1 else "tenés alguna mora reportada" if situacion <= 3 else "la cosa está complicada y hay que actuar rápido" }.
+Mirá, esto significa que { "estás al día" if situacion == 1 else "tenés alguna mora" if situacion <= 3 else "la cosa está complicada" }.
 
-**Próximos pasos que te recomiendo:**
-1. Ver exactamente qué banco o financiera te reportó.
-2. Negociar o pagar la deuda.
-3. Pedir el levantamiento una vez saldada.
+**Próximos pasos:**
+1. Ver qué entidad te reportó
+2. Negociar o pagar
+3. Pedir baja una vez saldada
 
-¿Querés que te arme el plan completo y personalizado para salir o mejorar tu situación?"""
+¿Querés el plan completo personalizado?"""
 
     elif bcra_data.get("status") == "no_history":
         response_text = """Tranca, no tenés deudas reportadas (Situación 0). 
-Sos un fantasma para los bancos todavía. 
-Esto es bueno, pero si querés pedir crédito en el futuro te conviene empezar a construir historial positivo.
-
-¿Querés tips rápidos para armar tu historial crediticio?"""
+Sos un fantasma para los bancos. 
+¿Querés tips para construir historial positivo?"""
 
     elif bcra_data.get("status") == "bcra_down":
-        response_text = """Uy, el BCRA está tomando un café y no responde ahora. 
-Ya anoté tu consulta. En unos minutos vuelvo a intentar y te aviso por acá."""
+        response_text = """Uy, el BCRA está lento o en mantenimiento. 
+Ya anoté tu consulta. Probá de nuevo en 5-10 minutos, che."""
 
     else:
         response_text = """Hubo un problemita técnico del lado del BCRA. 
-Probá de nuevo en un rato, che. Ya estoy arriba del tema."""
+El sistema está un poco inestable hoy. Probá de nuevo en unos minutos, ya estoy arriba del tema."""
 
     return {
         "response": response_text,
         "situacion": situacion,
         "bcra_status": bcra_data.get("status"),
-        "identificacion": ident,
-        "app_url": APP_URL
+        "identificacion": ident
     }
 
 @app.get("/")
 async def root():
-    return {
-        "app": "miboga - Tu boga digital para el BCRA",
-        "status": "running",
-        "version": "0.2.0 (miboga core)",
-        "chat_endpoint": f"{APP_URL}/chat",
-        "message": "Listo para usar. Probá el endpoint /chat con tu DNI o CUIT"
-    }
+    return {"app": "miboga", "status": "running", "message": "Listo para probar /chat"}

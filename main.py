@@ -1,135 +1,138 @@
 import os
-import json
-import random
-from datetime import date
-from typing import List, Dict
+import re
+from datetime import datetime
+from typing import Dict
+
 import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from groq import Groq
-from qdrant_client import QdrantClient
-from qdrant_client.http.models import Distance, VectorParams, PointStruct
+from supabase import create_client, Client
 
 # ==================== CONFIG ====================
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-QDRANT_URL = os.getenv("QDRANT_URL")
-QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
-APP_URL = os.getenv("APP_URL", "https://your-app.onrender.com")   # Render will give you this
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")      # Use your anon/public key for now
+APP_URL = os.getenv("APP_URL", "https://jubilant-octo-happiness.onrender.com")  # ← your current Render URL
 
-app = FastAPI(title="Central de Deudores RAG")
+app = FastAPI(title="miboga - Tu boga digital para el BCRA")
 
-groq_client: Groq = None
-qdrant_client: QdrantClient = None
-COLLECTION = "mitigaciones"
-DIM = 128
-
-# High-value hardcoded mitigation + Boletín context (expand easily later)
-DOCS: List[Dict] = [
-    {"id": "bcra1", "text": "La Central de Deudores del BCRA informa las deudas impagas reportadas por entidades. Che, si estás en situación 1-2 podés renegociar directamente con tu banco según Comunicación A 7584.", "metadata": {"source": "BCRA", "date": "2026-03-01", "type": "explanatory", "url": "https://www.bcra.gob.ar/central-deudores"}},
-    {"id": "mit1", "text": "Mirá, si tenés deuda en Central de Deudores podés pedir refinanciación con tu entidad. Modelo de carta: 'Solicito renegociación según Com. A 7584, adjunto CUIT y detalle deuda'.", "metadata": {"source": "BCRA Guía", "date": "2026-03-01", "type": "mitigation", "url": "https://www.bcra.gob.ar/mitigacion/renegociacion"}},
-    {"id": "mit2", "text": "Próximos pasos recomendados por BCRA: 1) Contactar banco, 2) Presentar propuesta de pago con cuotas, 3) Solicitar baja de Central una vez saldada. Links útiles en bcra.gob.ar.", "metadata": {"source": "BCRA", "date": "2026-03-10", "type": "mitigation", "url": "https://www.bcra.gob.ar/central-deudores/pasos"}},
-    {"id": "boletin1", "text": "Boletín Oficial - Comunicación A 7584: Plazos de renegociación extendidos hasta 90 días y posibilidad de quita de hasta 30% en deudas reportadas.", "metadata": {"source": "Boletín Oficial", "date": "2026-03-20", "type": "boletin", "url": "https://www.boletinoficial.gob.ar"}},
-]
-
-def get_embedding(text: str) -> List[float]:
-    # Deterministic fake embedding - zero external cost, tiny RAM, fully reproducible
-    h = hash(text) & 0xFFFFFFFF
-    random.seed(h)
-    return [random.uniform(-1.0, 1.0) for _ in range(DIM)]
-
-def get_bcra_data(cuit: str) -> Dict:
-    """Real public BCRA endpoints (no auth required)"""
-    try:
-        with httpx.Client(timeout=12) as client:
-            deudas = client.get(f"https://api.bcra.gob.ar/centraldedeudores/v1.0/Deudas/{cuit}").json()
-            cheques = client.get(f"https://api.bcra.gob.ar/centraldedeudores/v1.0/ChequesRechazados/{cuit}").json()
-        return {"deudas": deudas, "cheques": cheques}
-    except Exception:
-        return {"error": "No se pudo obtener datos del BCRA en este momento. Intentá más tarde."}
+supabase: Client = None
 
 @app.on_event("startup")
-def load_qdrant():
-    global groq_client, qdrant_client
-    groq_client = Groq(api_key=GROQ_API_KEY)
-    qdrant_client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=10)
+def startup():
+    global supabase
+    if SUPABASE_URL and SUPABASE_KEY:
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        print("✅ Supabase connected - miboga ready")
+    else:
+        print("⚠️  Supabase env vars missing - DB disabled for now")
 
+# ==================== BCRA SAFE LOOKUP (prueba de fuego) ====================
+def normalize_identificacion(ident: str) -> str:
+    cleaned = re.sub(r"\D", "", ident)
+    if len(cleaned) != 11 and len(cleaned) != 8:  # allow both CUIT (11) and DNI (8)
+        raise ValueError("El DNI o CUIT debe tener 8 o 11 dígitos")
+    return cleaned
+
+async def get_bcra_data(identificacion: str) -> Dict:
     try:
-        qdrant_client.get_collection(COLLECTION)
-    except:
-        qdrant_client.create_collection(
-            collection_name=COLLECTION,
-            vectors_config=VectorParams(size=DIM, distance=Distance.COSINE)
-        )
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            deudas_resp = await client.get(
+                f"https://api.bcra.gob.ar/centraldedeudores/v1.0/Deudas/{identificacion}"
+            )
+            deudas_resp.raise_for_status()
+            deudas = deudas_resp.json()
 
-    if qdrant_client.count(COLLECTION).count == 0:
-        points = []
-        for i, doc in enumerate(DOCS):
-            vec = get_embedding(doc["text"])
-            points.append(PointStruct(id=i, vector=vec, payload={**doc["metadata"], "text": doc["text"]}))
-        qdrant_client.upsert(collection_name=COLLECTION, points=points)
+            cheques_resp = await client.get(
+                f"https://api.bcra.gob.ar/centraldedeudores/v1.0/ChequesRechazados/{identificacion}"
+            )
+            cheques = cheques_resp.json() if cheques_resp.status_code == 200 else {}
 
-def retrieve_chunks(query: str, k: int = 5) -> str:
-    vec = get_embedding(query)
-    # NEW: Use query_points instead of the old .search
-    results = qdrant_client.query_points(
-        collection_name=COLLECTION,
-        query=vec,           # just pass the vector list
-        limit=k
-    )
-    # Extract the text from the returned points
-    texts = []
-    for point in results.points:
-        text = point.payload.get("text", "") if point.payload else ""
-        texts.append(text)
-    return "\n---\n".join(texts)
+        return {
+            "status": "success",
+            "identificacion": identificacion,
+            "deudas": deudas,
+            "cheques": cheques,
+            "timestamp": datetime.utcnow().isoformat()
+        }
 
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            return {"status": "no_history", "message": "No existe historial crediticio aún"}
+        raise
+    except httpx.TimeoutException:
+        return {"status": "bcra_down", "message": "El BCRA está lento o en mantenimiento"}
+    except Exception as e:
+        print(f"BCRA error: {e}")
+        return {"status": "error", "message": "No pudimos conectar con el BCRA"}
+
+# ==================== REQUEST MODEL ====================
 class ChatRequest(BaseModel):
-    cuit: str
-    question: str
+    identificacion: str        # DNI or CUIT
+    channel: str = "web"       # "web" or "whatsapp" (future)
 
+# ==================== MAIN CHAT ENDPOINT ====================
 @app.post("/chat")
 async def chat(req: ChatRequest):
-    if not GROQ_API_KEY or not QDRANT_URL or not QDRANT_API_KEY:
-        raise HTTPException(status_code=500, detail="Faltan variables de entorno")
+    try:
+        ident = normalize_identificacion(req.identificacion)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
-    debtor = get_bcra_data(req.cuit)
-    context = retrieve_chunks(req.question)
-    debtor_str = json.dumps(debtor, ensure_ascii=False, indent=2)
+    bcra_data = await get_bcra_data(ident)
 
-    system = """Eres un asesor empático y directo del Central de Deudores de Argentina.
-Responde SIEMPRE en español argentino natural, directo y amigable, usando “che”, “mirá”, “tranqui” cuando corresponda.
-Usa ÚNICAMENTE los chunks recuperados + el JSON del deudor. NUNCA inventes ni alucines información.
-Cada respuesta debe incluir:
-- Explicación clara de la situación.
-- Sección numerada “Próximos pasos” con acciones concretas, modelo de carta si aplica y enlaces.
-- Terminar EXACTAMENTE con: Fuente: BCRA API consultada hoy + Boletín Oficial [fecha] + Comunicación X"""
+    # Extract situation safely
+    if bcra_data.get("status") == "success":
+        try:
+            situacion = bcra_data["deudas"]["results"]["periodos"][0]["entidades"][0]["situacion"]
+        except (KeyError, IndexError, TypeError):
+            situacion = 0
+    else:
+        situacion = 0
 
-    user = f"""CUIT: {req.cuit}
-JSON BCRA: {debtor_str}
-Documentos recuperados: {context}
-Pregunta del usuario: {req.question}"""
+    # ==================== BOGA CRIOLLO RESPONSES ====================
+    if bcra_data.get("status") == "success":
+        response_text = f"""🇦🇷 Che, ya consulté tu situación en el BCRA.
 
-    resp = groq_client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-        temperature=0.2,
-        max_tokens=800
-    )
+Tu situación actual es **{situacion}**.
+
+Mirá, esto significa que { "estás al día y todo en orden" if situacion == 1 else "tenés alguna mora reportada" if situacion <= 3 else "la cosa está complicada y hay que actuar rápido" }.
+
+**Próximos pasos que te recomiendo:**
+1. Ver exactamente qué banco o financiera te reportó.
+2. Negociar o pagar la deuda.
+3. Pedir el levantamiento una vez saldada.
+
+¿Querés que te arme el plan completo y personalizado para salir o mejorar tu situación?"""
+
+    elif bcra_data.get("status") == "no_history":
+        response_text = """Tranca, no tenés deudas reportadas (Situación 0). 
+Sos un fantasma para los bancos todavía. 
+Esto es bueno, pero si querés pedir crédito en el futuro te conviene empezar a construir historial positivo.
+
+¿Querés tips rápidos para armar tu historial crediticio?"""
+
+    elif bcra_data.get("status") == "bcra_down":
+        response_text = """Uy, el BCRA está tomando un café y no responde ahora. 
+Ya anoté tu consulta. En unos minutos vuelvo a intentar y te aviso por acá."""
+
+    else:
+        response_text = """Hubo un problemita técnico del lado del BCRA. 
+Probá de nuevo en un rato, che. Ya estoy arriba del tema."""
 
     return {
-        "response": resp.choices[0].message.content,
+        "response": response_text,
+        "situacion": situacion,
+        "bcra_status": bcra_data.get("status"),
+        "identificacion": ident,
         "app_url": APP_URL
     }
 
 @app.get("/")
 async def root():
     return {
-        "app": "Central de Deudores RAG",
+        "app": "miboga - Tu boga digital para el BCRA",
         "status": "running",
+        "version": "0.2.0 (miboga core)",
         "chat_endpoint": f"{APP_URL}/chat",
-        "docs": f"{APP_URL}/docs"
+        "message": "Listo para usar. Probá el endpoint /chat con tu DNI o CUIT"
     }
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)

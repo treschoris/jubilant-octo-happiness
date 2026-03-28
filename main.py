@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Dict
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from supabase import create_client, Client
@@ -93,6 +93,25 @@ class ChatRequest(BaseModel):
     identificacion: str
     channel: str = "web"
 
+# ==================== SAVE TO SUPABASE ====================
+async def save_consultation(identificacion: str, situacion: int, wa_id: str = None):
+    if not supabase:
+        return
+    try:
+        data = {
+            "identificacion": identificacion,
+            "last_situation": situacion,
+            "last_check_at": datetime.utcnow().isoformat(),
+        }
+        if wa_id:
+            data["wa_id"] = wa_id
+
+        # Upsert: update if exists, insert if new
+        supabase.table("users").upsert(data, on_conflict="identificacion").execute()
+        print(f"✅ Saved consultation for {identificacion} (situation {situacion})")
+    except Exception as e:
+        print(f"Supabase save error: {e}")
+
 # ==================== CHAT ENDPOINT ====================
 @app.post("/chat")
 async def chat(req: ChatRequest):
@@ -113,6 +132,10 @@ async def chat(req: ChatRequest):
                     situacion = int(entidades[0].get("situacion", 0))
         except Exception:
             pass
+
+    # Save to Supabase on success
+    if bcra_data.get("status") == "success":
+        await save_consultation(ident, situacion)
 
     # ==================== BOGA RESPONSES ====================
     if bcra_data.get("status") == "success":

@@ -26,7 +26,7 @@ def startup():
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
         print("✅ Supabase connected - miboga ready")
     else:
-        print("⚠️ Supabase env vars missing")
+        print("⚠️ Supabase env vars missing - saving disabled")
 
 # Serve landing page at root
 @app.get("/", response_class=HTMLResponse)
@@ -88,29 +88,27 @@ async def get_bcra_data(identificacion: str) -> Dict:
 
     return {"status": "error", "message": "Error desconocido"}
 
-# ==================== REQUEST MODEL ====================
-class ChatRequest(BaseModel):
-    identificacion: str
-    channel: str = "web"
-
 # ==================== SAVE TO SUPABASE ====================
-async def save_consultation(identificacion: str, situacion: int, wa_id: str = None):
+async def save_consultation(identificacion: str, situacion: int):
     if not supabase:
+        print("⚠️ Supabase not connected - skipping save")
         return
     try:
         data = {
             "identificacion": identificacion,
             "last_situation": situacion,
-            "last_check_at": datetime.utcnow().isoformat(),
+            "last_check_at": datetime.utcnow().isoformat()
         }
-        if wa_id:
-            data["wa_id"] = wa_id
-
-        # Upsert: update if exists, insert if new
-        supabase.table("users").upsert(data, on_conflict="identificacion").execute()
-        print(f"✅ Saved consultation for {identificacion} (situation {situacion})")
+        result = supabase.table("users").upsert(data, on_conflict="identificacion").execute()
+        print(f"✅ Saved/Updated consultation for {identificacion} → situation {situacion}")
+        return result
     except Exception as e:
-        print(f"Supabase save error: {e}")
+        print(f"❌ Supabase save failed for {identificacion}: {str(e)}")
+
+# ==================== REQUEST MODEL ====================
+class ChatRequest(BaseModel):
+    identificacion: str
+    channel: str = "web"
 
 # ==================== CHAT ENDPOINT ====================
 @app.post("/chat")
@@ -133,9 +131,12 @@ async def chat(req: ChatRequest):
         except Exception:
             pass
 
-    # Save to Supabase on success
+    # Save to Supabase ONLY on successful BCRA response
     if bcra_data.get("status") == "success":
         await save_consultation(ident, situacion)
+        print(f"💾 Attempted to save situation {situacion} for {ident}")
+    else:
+        print(f"⚠️ No save - BCRA status was {bcra_data.get('status')}")
 
     # ==================== BOGA RESPONSES ====================
     if bcra_data.get("status") == "success":

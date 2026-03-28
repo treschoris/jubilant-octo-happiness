@@ -5,7 +5,9 @@ from datetime import datetime
 from typing import Dict
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from supabase import create_client, Client
 
@@ -27,6 +29,15 @@ def startup():
     else:
         print("⚠️ Supabase env vars missing")
 
+# Mount static files so index.html can be served
+app.mount("/static", StaticFiles(directory="."), name="static")
+
+# ==================== SERVE LANDING PAGE AT ROOT ====================
+@app.get("/", response_class=HTMLResponse)
+async def root():
+    with open("index.html", "r", encoding="utf-8") as f:
+        return f.read()
+
 # ==================== BCRA LOOKUP WITH RETRIES ====================
 def normalize_identificacion(ident: str) -> str:
     cleaned = re.sub(r"\D", "", ident)
@@ -40,14 +51,12 @@ async def get_bcra_data(identificacion: str) -> Dict:
     for attempt in range(max_retries + 1):
         try:
             async with httpx.AsyncClient(timeout=12.0) as client:
-                # Main Deudas endpoint
                 deudas_resp = await client.get(
                     f"https://api.bcra.gob.ar/centraldedeudores/v1.0/Deudas/{identificacion}"
                 )
                 deudas_resp.raise_for_status()
                 deudas = deudas_resp.json()
 
-                # Cheques rechazados endpoint (optional)
                 cheques = {}
                 try:
                     cheques_resp = await client.get(
@@ -56,7 +65,7 @@ async def get_bcra_data(identificacion: str) -> Dict:
                     if cheques_resp.status_code == 200:
                         cheques = cheques_resp.json()
                 except Exception:
-                    pass  # Cheques often fails or returns empty — we ignore gracefully
+                    pass
 
             print(f"✅ BCRA success for {identificacion} (attempt {attempt+1})")
             return {
@@ -88,7 +97,7 @@ class ChatRequest(BaseModel):
     identificacion: str
     channel: str = "web"
 
-# ==================== MAIN CHAT ENDPOINT ====================
+# ==================== CHAT ENDPOINT ====================
 @app.post("/chat")
 async def chat(req: ChatRequest):
     try:
@@ -98,7 +107,6 @@ async def chat(req: ChatRequest):
 
     bcra_data = await get_bcra_data(ident)
 
-    # Safe situation extraction
     situacion = 0
     if bcra_data.get("status") == "success":
         try:
@@ -110,62 +118,48 @@ async def chat(req: ChatRequest):
         except Exception:
             pass
 
-    # ==================== SITUATION-BASED BOGA RESPONSES ====================
+    # ==================== BOGA RESPONSES ====================
     if bcra_data.get("status") == "success":
         if situacion == 1:
             response_text = f"""🇦🇷 ¡Excelente noticia, che! 
 
 Tu situación en el BCRA es **1** — estás completamente al día y todo en orden. 👍
 
-Esto significa que pagás todo puntualmente y no tenés ninguna mora reportada. Los bancos te ven como un buen cliente.
+Esto significa que pagás todo puntualmente y no tenés ninguna mora reportada.
 
-**Consejos de tu boga para mantenerte en esta zona:**
-1. Seguís así: mantené los pagos al día.
-2. Revisá mensualmente (el BCRA se actualiza todos los meses).
-3. Si querés crecer tu crédito, podés pedir tarjetas o préstamos con mejores tasas.
+**Consejos de tu boga:**
+1. Mantené los pagos al día.
+2. Revisá mensualmente.
+3. Si querés crecer, podés pedir mejores tasas.
 
-¿Querés que te avise gratis el mes que viene cuando el BCRA actualice tu situación? (Solo un mensaje por mes)
-
-O decime y te doy tips para seguir fortaleciendo tu historial crediticio."""
+¿Querés que te avise gratis el mes que viene?"""
 
         elif situacion in (2, 3):
             response_text = f"""🇦🇷 Che, tu situación actual es **{situacion}**.
 
-Esto significa que tenés alguna mora reportada, pero todavía no es crítica. Los bancos la miran con atención.
+Tenés alguna mora, pero no es crítica.
 
-**Próximos pasos recomendados:**
-1. Ver exactamente qué entidad (banco o financiera) te reportó.
-2. Negociar o regularizar esa deuda lo antes posible.
-3. Una vez pagada, pedir el levantamiento (tienen 10 días hábiles para actualizar).
+**Próximos pasos:**
+1. Ver qué entidad te reportó.
+2. Negociar o regularizar.
+3. Pedir levantamiento una vez pagada.
 
-¿Querés que te arme un plan simple y personalizado para mejorar esto rápido?"""
+¿Querés un plan personalizado?"""
 
         else:  # 4 or 5
             response_text = f"""🇦🇷 Mirá, tu situación es **{situacion}** — la cosa está complicada.
 
-Esto suele significar atrasos importantes o deuda en alto riesgo. No te asustes, pero hay que actuar.
+No te asustes, pero hay que actuar rápido.
 
-**Qué te recomiendo hacer:**
-1. Identificar exactamente qué deudas te tienen en esta situación.
-2. Negociar con la entidad (muchas aceptan quitas o planes).
-3. Una vez acordado el pago, pedir el certificado de libre deuda.
-
-¿Querés que analice los detalles y te arme un plan concreto para salir de esta? Estoy para ayudarte."""
+¿Querés que te arme un plan concreto?"""
 
     elif bcra_data.get("status") == "no_history":
         response_text = """Tranca, no tenés deudas reportadas (Situación 0). 
-Sos un "fantasma" para el sistema financiero todavía. 
 
-Esto es neutro: bueno porque no tenés problemas, pero puede complicarte si querés pedir crédito pronto.
-
-¿Querés tips rápidos para empezar a construir un buen historial crediticio?"""
-
-    elif bcra_data.get("status") == "bcra_down":
-        response_text = """El sistema del BCRA está temporalmente inestable (pasa bastante seguido). 
-Ya me estoy ocupando — probá de nuevo en 10-15 segundos."""
+¿Querés tips para construir historial?"""
 
     else:
-        response_text = """El sistema del BCRA está temporalmente inestable (pasa bastante seguido). 
+        response_text = """El sistema del BCRA está temporalmente inestable. 
 Ya me estoy ocupando — probá de nuevo en 10-15 segundos."""
 
     return {
@@ -175,11 +169,6 @@ Ya me estoy ocupando — probá de nuevo en 10-15 segundos."""
         "identificacion": ident
     }
 
-@app.get("/")
-async def root():
-    return {
-        "app": "miboga - Tu boga digital para el BCRA",
-        "status": "running",
-        "version": "0.5.1 (natural language fix)",
-        "message": "Probá POST /chat con tu DNI o CUIT"
-    }
+@app.get("/health")
+async def health():
+    return {"status": "ok"}

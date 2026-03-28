@@ -31,7 +31,7 @@ def startup():
 def normalize_identificacion(ident: str) -> str:
     cleaned = re.sub(r"\D", "", ident)
     if len(cleaned) not in (8, 11):
-        raise ValueError("El DNI o CUIT debe tener 8 o 11 dígitos")
+        raise ValueError("El DNI o CUIT debe tener 8 u 11 dígitos")
     return cleaned
 
 async def get_bcra_data(identificacion: str) -> Dict:
@@ -40,12 +40,14 @@ async def get_bcra_data(identificacion: str) -> Dict:
     for attempt in range(max_retries + 1):
         try:
             async with httpx.AsyncClient(timeout=12.0) as client:
+                # Main Deudas endpoint
                 deudas_resp = await client.get(
                     f"https://api.bcra.gob.ar/centraldedeudores/v1.0/Deudas/{identificacion}"
                 )
                 deudas_resp.raise_for_status()
                 deudas = deudas_resp.json()
 
+                # Cheques rechazados endpoint (optional)
                 cheques = {}
                 try:
                     cheques_resp = await client.get(
@@ -54,7 +56,7 @@ async def get_bcra_data(identificacion: str) -> Dict:
                     if cheques_resp.status_code == 200:
                         cheques = cheques_resp.json()
                 except Exception:
-                    pass
+                    pass  # Cheques often fails or returns empty — we ignore gracefully
 
             print(f"✅ BCRA success for {identificacion} (attempt {attempt+1})")
             return {
@@ -71,7 +73,7 @@ async def get_bcra_data(identificacion: str) -> Dict:
                 if isinstance(e, httpx.HTTPStatusError) and e.response.status_code == 404:
                     return {"status": "no_history", "message": "No existe historial crediticio aún"}
                 return {"status": "bcra_down", "message": "Sistema del BCRA temporalmente inestable"}
-            await asyncio.sleep(1.5)  # short backoff
+            await asyncio.sleep(1.5)
 
         except Exception as e:
             print(f"BCRA unexpected error: {str(e)}")
@@ -160,7 +162,7 @@ Esto es neutro: bueno porque no tenés problemas, pero puede complicarte si quer
 
     elif bcra_data.get("status") == "bcra_down":
         response_text = """El sistema del BCRA está temporalmente inestable (pasa bastante seguido). 
-Ya me estoy ocupando — probá de nuevo en 10-15 segundos con el botón de abajo."""
+Ya me estoy ocupando — probá de nuevo en 10-15 segundos."""
 
     else:
         response_text = """El sistema del BCRA está temporalmente inestable (pasa bastante seguido). 
@@ -178,6 +180,6 @@ async def root():
     return {
         "app": "miboga - Tu boga digital para el BCRA",
         "status": "running",
-        "version": "0.5.0 (retries + transparent errors)",
+        "version": "0.5.1 (natural language fix)",
         "message": "Probá POST /chat con tu DNI o CUIT"
     }

@@ -7,7 +7,6 @@ from typing import Dict
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from supabase import create_client, Client
 
@@ -29,10 +28,7 @@ def startup():
     else:
         print("⚠️ Supabase env vars missing")
 
-# Mount static files so index.html can be served
-app.mount("/static", StaticFiles(directory="."), name="static")
-
-# ==================== SERVE LANDING PAGE AT ROOT ====================
+# Serve landing page at root
 @app.get("/", response_class=HTMLResponse)
 async def root():
     with open("index.html", "r", encoding="utf-8") as f:
@@ -103,7 +99,7 @@ async def chat(req: ChatRequest):
     try:
         ident = normalize_identificacion(req.identificacion)
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        return {"response": "El DNI o CUIT debe tener 8 u 11 dígitos. Probá de nuevo sin puntos ni guiones."}
 
     bcra_data = await get_bcra_data(ident)
 
@@ -159,7 +155,7 @@ No te asustes, pero hay que actuar rápido.
 ¿Querés tips para construir historial?"""
 
     else:
-        response_text = """El sistema del BCRA está temporalmente inestable. 
+        response_text = """El sistema del BCRA está temporalmente inestable (pasa bastante seguido). 
 Ya me estoy ocupando — probá de nuevo en 10-15 segundos."""
 
     return {
@@ -168,7 +164,3 @@ Ya me estoy ocupando — probá de nuevo en 10-15 segundos."""
         "bcra_status": bcra_data.get("status"),
         "identificacion": ident
     }
-
-@app.get("/health")
-async def health():
-    return {"status": "ok"}

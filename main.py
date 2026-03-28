@@ -1,5 +1,6 @@
 import os
 import re
+import asyncio
 from datetime import datetime
 from typing import Dict
 
@@ -26,7 +27,7 @@ def startup():
     else:
         print("⚠️ Supabase env vars missing")
 
-# ==================== BCRA LOOKUP ====================
+# ==================== BCRA LOOKUP WITH RETRIES ====================
 def normalize_identificacion(ident: str) -> str:
     cleaned = re.sub(r"\D", "", ident)
     if len(cleaned) not in (8, 11):
@@ -35,44 +36,50 @@ def normalize_identificacion(ident: str) -> str:
 
 async def get_bcra_data(identificacion: str) -> Dict:
     print(f"🔍 Consultando BCRA para: {identificacion}")
-    try:
-        async with httpx.AsyncClient(timeout=12.0) as client:
-            deudas_resp = await client.get(
-                f"https://api.bcra.gob.ar/centraldedeudores/v1.0/Deudas/{identificacion}"
-            )
-            deudas_resp.raise_for_status()
-            deudas = deudas_resp.json()
-
-            cheques = {}
-            try:
-                cheques_resp = await client.get(
-                    f"https://api.bcra.gob.ar/centraldedeudores/v1.0/Deudas/ChequesRechazados/{identificacion}"
+    max_retries = 2
+    for attempt in range(max_retries + 1):
+        try:
+            async with httpx.AsyncClient(timeout=12.0) as client:
+                deudas_resp = await client.get(
+                    f"https://api.bcra.gob.ar/centraldedeudores/v1.0/Deudas/{identificacion}"
                 )
-                if cheques_resp.status_code == 200:
-                    cheques = cheques_resp.json()
-            except Exception:
-                pass
+                deudas_resp.raise_for_status()
+                deudas = deudas_resp.json()
 
-        print(f"✅ BCRA success for {identificacion}")
-        return {
-            "status": "success",
-            "identificacion": identificacion,
-            "deudas": deudas,
-            "cheques": cheques,
-            "timestamp": datetime.utcnow().isoformat()
-        }
+                cheques = {}
+                try:
+                    cheques_resp = await client.get(
+                        f"https://api.bcra.gob.ar/centraldedeudores/v1.0/Deudas/ChequesRechazados/{identificacion}"
+                    )
+                    if cheques_resp.status_code == 200:
+                        cheques = cheques_resp.json()
+                except Exception:
+                    pass
 
-    except httpx.HTTPStatusError as e:
-        print(f"BCRA HTTP {e.response.status_code} for {identificacion}")
-        if e.response.status_code == 404:
-            return {"status": "no_history", "message": "No existe historial crediticio aún"}
-        return {"status": "error", "message": f"HTTP {e.response.status_code}"}
-    except httpx.TimeoutException:
-        print("BCRA timeout")
-        return {"status": "bcra_down", "message": "Timeout - BCRA lento"}
-    except Exception as e:
-        print(f"BCRA error: {str(e)}")
-        return {"status": "error", "message": str(e)}
+            print(f"✅ BCRA success for {identificacion} (attempt {attempt+1})")
+            return {
+                "status": "success",
+                "identificacion": identificacion,
+                "deudas": deudas,
+                "cheques": cheques,
+                "timestamp": datetime.utcnow().isoformat()
+            }
+
+        except (httpx.TimeoutException, httpx.HTTPStatusError) as e:
+            print(f"BCRA error (attempt {attempt+1}/{max_retries+1}): {e}")
+            if attempt == max_retries:
+                if isinstance(e, httpx.HTTPStatusError) and e.response.status_code == 404:
+                    return {"status": "no_history", "message": "No existe historial crediticio aún"}
+                return {"status": "bcra_down", "message": "Sistema del BCRA temporalmente inestable"}
+            await asyncio.sleep(1.5)  # short backoff
+
+        except Exception as e:
+            print(f"BCRA unexpected error: {str(e)}")
+            if attempt == max_retries:
+                return {"status": "error", "message": str(e)}
+            await asyncio.sleep(1.5)
+
+    return {"status": "error", "message": "Error desconocido"}
 
 # ==================== REQUEST MODEL ====================
 class ChatRequest(BaseModel):
@@ -118,7 +125,7 @@ Esto significa que pagás todo puntualmente y no tenés ninguna mora reportada. 
 ¿Querés que te avise gratis el mes que viene cuando el BCRA actualice tu situación? (Solo un mensaje por mes)
 
 O decime y te doy tips para seguir fortaleciendo tu historial crediticio."""
-        
+
         elif situacion in (2, 3):
             response_text = f"""🇦🇷 Che, tu situación actual es **{situacion}**.
 
@@ -130,7 +137,7 @@ Esto significa que tenés alguna mora reportada, pero todavía no es crítica. L
 3. Una vez pagada, pedir el levantamiento (tienen 10 días hábiles para actualizar).
 
 ¿Querés que te arme un plan simple y personalizado para mejorar esto rápido?"""
-        
+
         else:  # 4 or 5
             response_text = f"""🇦🇷 Mirá, tu situación es **{situacion}** — la cosa está complicada.
 
@@ -152,12 +159,12 @@ Esto es neutro: bueno porque no tenés problemas, pero puede complicarte si quer
 ¿Querés tips rápidos para empezar a construir un buen historial crediticio?"""
 
     elif bcra_data.get("status") == "bcra_down":
-        response_text = """Uy, el BCRA está lento o en mantenimiento ahora. 
-Ya anoté tu consulta. Probá de nuevo en 5-10 minutos, che."""
+        response_text = """El sistema del BCRA está temporalmente inestable (pasa bastante seguido). 
+Ya me estoy ocupando — probá de nuevo en 10-15 segundos con el botón de abajo."""
 
     else:
-        response_text = """Hubo un problemita técnico del lado del BCRA (es bastante inestable). 
-Probá de nuevo en unos minutos, ya me estoy ocupando."""
+        response_text = """El sistema del BCRA está temporalmente inestable (pasa bastante seguido). 
+Ya me estoy ocupando — probá de nuevo en 10-15 segundos."""
 
     return {
         "response": response_text,
@@ -171,6 +178,6 @@ async def root():
     return {
         "app": "miboga - Tu boga digital para el BCRA",
         "status": "running",
-        "version": "0.4.1 (natural language)",
+        "version": "0.5.0 (retries + transparent errors)",
         "message": "Probá POST /chat con tu DNI o CUIT"
     }

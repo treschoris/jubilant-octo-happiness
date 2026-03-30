@@ -6,6 +6,7 @@ from typing import Dict
 
 import httpx
 from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.staticfiles import StaticFiles   # ← NEW LINE
 from pydantic import BaseModel
 from supabase import create_client, Client
 
@@ -94,8 +95,6 @@ async def save_report(ident: str, bcra_data: Dict, response_text: str, situacion
 async def process_bcra_lookup(ident: str):
     situacion = 0
     response_text = ""
-    final_status = "error"
-
     for attempt in range(5):
         bcra_data = await get_bcra_data(ident)
 
@@ -109,6 +108,7 @@ async def process_bcra_lookup(ident: str):
             except Exception:
                 pass
 
+            # boga responses (same as before)
             if situacion == 1:
                 response_text = f"""🇦🇷 ¡Excelente noticia, che! 
 
@@ -141,7 +141,6 @@ Esto suele significar atrasos importantes o deuda en alto riesgo. No te asustes,
 2. Negociar con la entidad.
 3. Una vez acordado el pago, pedir el certificado de libre deuda."""
 
-            final_status = "success"
             await save_report(ident, bcra_data, response_text, situacion, "success")
             return
 
@@ -155,7 +154,7 @@ Sos un "fantasma" para el sistema financiero todavía.
 
         await asyncio.sleep(8)
 
-    # Fallback
+    # Fallback after retries
     response_text = """El BCRA sigue lento hoy. Ya guardé tu consulta y sigo intentando en segundo plano. Te aviso apenas tenga tu situación."""
     await save_report(ident, {}, response_text, 0, "error")
 
@@ -164,7 +163,7 @@ class ChatRequest(BaseModel):
     identificacion: str
     channel: str = "web"
 
-# ==================== CHAT ENDPOINT ====================
+# ==================== API ENDPOINTS ====================
 @app.post("/chat")
 async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
     try:
@@ -173,10 +172,8 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=400, detail=str(e))
 
     background_tasks.add_task(process_bcra_lookup, ident)
-
     return {"status": "processing", "identificacion": ident}
 
-# ==================== STATUS POLLING ====================
 @app.get("/status/{identificacion}")
 async def get_status(identificacion: str):
     try:
@@ -192,7 +189,6 @@ async def get_status(identificacion: str):
     except Exception:
         return {"status": "error", "message": "Error interno"}
 
-# ==================== REPORT PAGE ====================
 @app.get("/report/{identificacion}")
 async def report_page(identificacion: str):
     try:
@@ -224,8 +220,7 @@ async def report_page(identificacion: str):
     except Exception:
         return "<h1>Algo salió mal. Probá de nuevo.</h1>"
 
-@app.get("/")
-async def root():
-    return {"app": "miboga", "status": "running"}
+# ==================== SERVE index.html AT ROOT (IMPORTANT) ====================
+app.mount("/", StaticFiles(directory=".", html=True), name="static")   # ← THIS RESTORES YOUR WEBSITE
 
-print("🚀 miboga backend with background tasks loaded")
+print("🚀 miboga backend with background tasks + static HTML loaded")

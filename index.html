@@ -1,97 +1,121 @@
 <!DOCTYPE html>
-<html lang="es-AR">
+<html lang="es">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>miboga - Tu boga digital para el BCRA</title>
+    <script src="https://cdn.tailwindcss.com"></script>
     <style>
-        body { font-family: system-ui, -apple-system, sans-serif; background: #f8f9fa; margin: 0; padding: 20px; }
-        .container { max-width: 620px; margin: 40px auto; background: white; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.1); overflow: hidden; }
-        header { background: #0056b3; color: white; padding: 20px; text-align: center; }
-        h1 { margin: 0; font-size: 1.8rem; }
-        .content { padding: 30px; }
-        input[type="text"] { width: 100%; padding: 14px; font-size: 1.1rem; border: 2px solid #ddd; border-radius: 8px; margin-bottom: 15px; box-sizing: border-box; }
-        button { width: 100%; padding: 14px; background: #28a745; color: white; border: none; border-radius: 8px; font-size: 1.1rem; cursor: pointer; }
-        button:hover { background: #218838; }
-        button:disabled { background: #6c757d; cursor: not-allowed; }
-        #result { margin-top: 20px; padding: 15px; border-radius: 8px; min-height: 120px; white-space: pre-wrap; line-height: 1.5; }
-        .success { background: #d4edda; border: 1px solid #c3e6cb; }
-        .warning { background: #fff3cd; border: 1px solid #ffeaa7; }
-        .error { background: #f8d7da; border: 1px solid #f5c6cb; }
-        .info { font-size: 0.95rem; color: #666; margin-top: 25px; }
-        .loading { color: #0056b3; }
+        body { font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
     </style>
 </head>
-<body>
-    <div class="container">
-        <header>
-            <h1>🇦🇷 miboga</h1>
-            <p>Tu boga digital para consultar el BCRA</p>
-        </header>
-        <div class="content">
-            <h2>Consultá tu situación crediticia gratis</h2>
-            <p>Ingresá tu DNI o CUIT (sin puntos ni guiones)</p>
-            
-            <input type="text" id="identificacion" placeholder="Ej: 20123456789 o 12345678" maxlength="11">
-            <button id="btnConsultar" onclick="consultar()">Consultar ahora</button>
-            
-            <div id="result"></div>
-            
-            <div class="info">
-                • Fuente oficial: Central de Deudores del BCRA<br>
-                • Consulta pública y gratuita<br>
-                • No guardamos tus datos permanentemente
+<body class="bg-slate-50 text-slate-900">
+    <div class="max-w-3xl mx-auto px-4 py-12">
+        <!-- Hero -->
+        <div class="text-center mb-12">
+            <h1 class="text-5xl font-bold flex items-center justify-center gap-3">🇦🇷 miboga</h1>
+            <p class="text-2xl text-slate-600 mt-2">Tu boga digital para el BCRA</p>
+            <p class="mt-6 text-xl text-emerald-700">Consultá tu situación crediticia <span class="font-semibold">gratis</span> en segundos</p>
+        </div>
+
+        <!-- Tool -->
+        <div class="bg-white rounded-3xl shadow-xl p-8 mb-16">
+            <h2 class="text-2xl font-semibold mb-6">Consultá tu situación ahora</h2>
+            <div class="flex gap-3">
+                <input id="ident" type="text" placeholder="DNI o CUIT (solo números)" 
+                       class="flex-1 px-6 py-4 text-lg border border-slate-300 rounded-2xl focus:outline-none focus:border-emerald-500">
+                <button onclick="consultar()" 
+                        class="px-10 bg-emerald-600 hover:bg-emerald-700 text-white font-semibold rounded-2xl transition">
+                    Consultar
+                </button>
             </div>
+            
+            <p id="status" class="mt-4 text-sm text-slate-500 min-h-[24px]"></p>
+            
+            <!-- Result area -->
+            <div id="result" class="hidden mt-8 p-6 bg-slate-50 rounded-2xl border border-slate-200"></div>
+        </div>
+
+        <!-- Content teaser -->
+        <div class="prose max-w-none">
+            <h2 class="text-3xl font-semibold mb-8">Central de Deudores del BCRA: Lo que realmente importa</h2>
+            <p class="text-lg leading-relaxed">El BCRA es la fuente oficial. Situación 1 = todo bien. Situación 5 = hay que actuar. Aquí un resumen rápido:</p>
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-6 my-10">
+                <div class="bg-white p-6 rounded-2xl shadow-sm">1 → <span class="text-emerald-600 font-semibold">Normal</span><br>Pagás al día. Bancos te aman.</div>
+                <div class="bg-white p-6 rounded-2xl shadow-sm">2-3 → <span class="text-amber-600 font-semibold">Atención</span><br>Alguna mora. Negociá rápido.</div>
+                <div class="bg-white p-6 rounded-2xl shadow-sm">4-5 → <span class="text-red-600 font-semibold">Urgente</span><br>Deuda complicada. Te ayudo a salir.</div>
+            </div>
+            <p class="text-slate-600">¿Ya pagaste pero seguís apareciendo? ¿Querés construir historial o mirar subsidios ANSES después? Guardá tu reporte y seguí explorando.</p>
         </div>
     </div>
 
     <script>
-        const API_URL = "https://jubilant-octo-happiness.onrender.com/chat";
+        let pollInterval = null;
 
         async function consultar() {
-            const input = document.getElementById("identificacion").value.trim();
-            const resultDiv = document.getElementById("result");
-            const button = document.getElementById("btnConsultar");
-
-            if (!input) {
-                resultDiv.innerHTML = `<p class="error">Por favor ingresá tu DNI o CUIT.</p>`;
+            const ident = document.getElementById('ident').value.trim().replace(/\D/g, '');
+            const statusEl = document.getElementById('status');
+            const resultEl = document.getElementById('result');
+            
+            if (ident.length !== 8 && ident.length !== 11) {
+                statusEl.textContent = '❌ El DNI debe tener 8 dígitos o CUIT 11';
                 return;
             }
-
-            button.disabled = true;
-            button.textContent = "Consultando...";
-            resultDiv.innerHTML = `<p class="loading">Consultando al BCRA...</p>`;
-
+            
+            statusEl.innerHTML = '🔍 <span class="text-emerald-600">Recibido. Estoy consultando el BCRA oficial ahora mismo...</span><br><span class="text-xs">Esto puede tardar 10-60 segundos porque el sistema público es lento, pero ya estoy adentro.</span>';
+            resultEl.classList.add('hidden');
+            
+            if (pollInterval) clearInterval(pollInterval);
+            
             try {
-                const response = await fetch(API_URL, {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ identificacion: input, channel: "web" })
+                await fetch('/chat', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ identificacion: ident, channel: 'web' })
                 });
-
-                const data = await response.json();
-
-                if (response.ok && data.response) {
-                    let cssClass = "info";
-                    if (data.situacion === 1) cssClass = "success";
-                    if (data.bcra_status !== "success") cssClass = "warning";
-
-                    resultDiv.innerHTML = `<div class="${cssClass}">${data.response}</div>`;
-                } else {
-                    // Backend returned error status or malformed response
-                    resultDiv.innerHTML = `<p class="error">El sistema del BCRA está temporalmente inestable.<br>Ya me estoy ocupando — probá de nuevo en 10-15 segundos.</p>`;
-                }
-            } catch (err) {
-                resultDiv.innerHTML = `<p class="error">No pudimos conectar con el servidor en este momento.<br>Probá de nuevo en unos segundos.</p>`;
-            } finally {
-                button.disabled = false;
-                button.textContent = "Consultar ahora";
+                
+                // Start polling
+                pollInterval = setInterval(() => checkStatus(ident), 4000);
+                checkStatus(ident); // first check
+            } catch (e) {
+                statusEl.textContent = '⚠️ Problemita técnico — probá de nuevo';
             }
         }
 
-        // Allow pressing Enter
-        document.getElementById("identificacion").addEventListener("keypress", function(e) {
-            if (e.key === "Enter") consultar();
+        async function checkStatus(ident) {
+            const statusEl = document.getElementById('status');
+            const resultEl = document.getElementById('result');
+            
+            try {
+                const res = await fetch(`/status/${ident}`);
+                const data = await res.json();
+                
+                if (data.status === 'ready') {
+                    clearInterval(pollInterval);
+                    statusEl.textContent = '';
+                    resultEl.innerHTML = `
+                        <div class="text-lg leading-relaxed">${data.response}</div>
+                        <div class="mt-6 pt-6 border-t flex justify-between items-center">
+                            <span class="font-mono text-emerald-600">ID: ${ident}</span>
+                            <a href="/report/${ident}" 
+                               class="px-6 py-3 bg-emerald-600 hover:bg-emerald-700 text-white font-medium rounded-2xl">
+                                📄 Ver reporte completo y guardarlo
+                            </a>
+                        </div>
+                    `;
+                    resultEl.classList.remove('hidden');
+                } else if (data.status === 'processing') {
+                    // still waiting — do nothing
+                } else {
+                    clearInterval(pollInterval);
+                    statusEl.textContent = '⚠️ ' + (data.message || 'Algo salió mal');
+                }
+            } catch (e) {}
+        }
+
+        // Enter key support
+        document.getElementById('ident').addEventListener('keypress', e => {
+            if (e.key === 'Enter') consultar();
         });
     </script>
 </body>

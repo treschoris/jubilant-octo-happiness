@@ -5,8 +5,8 @@ from datetime import datetime
 from typing import Dict
 
 import httpx
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
-from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from supabase import create_client, Client
@@ -15,7 +15,6 @@ from supabase import create_client, Client
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 APP_URL = os.getenv("APP_URL", "https://jubilant-octo-happiness.onrender.com")
-WHATSAPP_VERIFY_TOKEN = "miboga2026"  # Change only if you want
 
 app = FastAPI(title="miboga - Tu boga digital para el BCRA")
 
@@ -121,3 +120,6 @@ Esto significa que pagás todo puntualmente y no tenés ninguna mora reportada. 
 1. Seguís así: mantené los pagos al día.
 2. Revisá mensualmente (el BCRA se actualiza todos los meses).
 3. Si querés crecer tu crédito, podés pedir tarjetas o préstamos con mejores tasas.
+
+¿Querés que te avise gratis el mes que viene cuando el BCRA actualice tu situación?"""
+            elif situacion in (2

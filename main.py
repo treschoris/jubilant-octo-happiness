@@ -5,18 +5,13 @@ from datetime import datetime
 from typing import Dict
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 from supabase import create_client, Client
 
 # ==================== CONFIG ====================
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
-PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
-VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "miboga_verify")
-
 APP_URL = os.getenv("APP_URL", "https://jubilant-octo-happiness.onrender.com")
 
 app = FastAPI(title="miboga - Tu boga digital para el BCRA")
@@ -32,204 +27,205 @@ def startup():
     else:
         print("⚠️ Supabase env vars missing")
 
-# Serve landing page at root
-@app.get("/", response_class=HTMLResponse)
-async def root():
-    with open("index.html", "r", encoding="utf-8") as f:
-        return f.read()
-
-# ==================== BCRA LOOKUP WITH RETRIES ====================
+# ==================== BCRA LOOKUP ====================
 def normalize_identificacion(ident: str) -> str:
     cleaned = re.sub(r"\D", "", ident)
     if len(cleaned) not in (8, 11):
-        raise ValueError("El DNI o CUIT debe tener 8 u 11 dígitos")
+        raise ValueError("El DNI o CUIT debe tener 8 o 11 dígitos")
     return cleaned
 
 async def get_bcra_data(identificacion: str) -> Dict:
     print(f"🔍 Consultando BCRA para: {identificacion}")
-    max_retries = 2
-    for attempt in range(max_retries + 1):
-        try:
-            async with httpx.AsyncClient(timeout=12.0) as client:
-                deudas_resp = await client.get(
-                    f"https://api.bcra.gob.ar/centraldedeudores/v1.0/Deudas/{identificacion}"
+    try:
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            deudas_resp = await client.get(
+                f"https://api.bcra.gob.ar/centraldedeudores/v1.0/Deudas/{identificacion}"
+            )
+            deudas_resp.raise_for_status()
+            deudas = deudas_resp.json()
+
+            cheques = {}
+            try:
+                cheques_resp = await client.get(
+                    f"https://api.bcra.gob.ar/centraldedeudores/v1.0/Deudas/ChequesRechazados/{identificacion}"
                 )
-                deudas_resp.raise_for_status()
-                deudas = deudas_resp.json()
+                if cheques_resp.status_code == 200:
+                    cheques = cheques_resp.json()
+            except Exception:
+                pass
 
-                cheques = {}
-                try:
-                    cheques_resp = await client.get(
-                        f"https://api.bcra.gob.ar/centraldedeudores/v1.0/Deudas/ChequesRechazados/{identificacion}"
-                    )
-                    if cheques_resp.status_code == 200:
-                        cheques = cheques_resp.json()
-                except Exception:
-                    pass
+        print(f"✅ BCRA success for {identificacion}")
+        return {
+            "status": "success",
+            "identificacion": identificacion,
+            "deudas": deudas,
+            "cheques": cheques,
+            "timestamp": datetime.utcnow().isoformat()
+        }
 
-            print(f"✅ BCRA success for {identificacion} (attempt {attempt+1})")
-            return {
-                "status": "success",
-                "identificacion": identificacion,
-                "deudas": deudas,
-                "cheques": cheques,
-                "timestamp": datetime.utcnow().isoformat()
-            }
-
-        except (httpx.TimeoutException, httpx.HTTPStatusError) as e:
-            print(f"BCRA error (attempt {attempt+1}/{max_retries+1}): {e}")
-            if attempt == max_retries:
-                if isinstance(e, httpx.HTTPStatusError) and e.response.status_code == 404:
-                    return {"status": "no_history", "message": "No existe historial crediticio aún"}
-                return {"status": "bcra_down", "message": "Sistema del BCRA temporalmente inestable"}
-            await asyncio.sleep(1.5)
-
-        except Exception as e:
-            print(f"BCRA unexpected error: {str(e)}")
-            if attempt == max_retries:
-                return {"status": "error", "message": str(e)}
-            await asyncio.sleep(1.5)
-
-    return {"status": "error", "message": "Error desconocido"}
+    except httpx.HTTPStatusError as e:
+        print(f"BCRA HTTP {e.response.status_code} for {identificacion}")
+        if e.response.status_code == 404:
+            return {"status": "no_history", "message": "No existe historial crediticio aún"}
+        return {"status": "error", "message": f"HTTP {e.response.status_code}"}
+    except httpx.TimeoutException:
+        print("BCRA timeout")
+        return {"status": "bcra_down", "message": "Timeout - BCRA lento"}
+    except Exception as e:
+        print(f"BCRA error: {str(e)}")
+        return {"status": "error", "message": str(e)}
 
 # ==================== SAVE TO SUPABASE ====================
-async def save_consultation(identificacion: str, situacion: int):
-    if not supabase:
-        return
+async def save_report(ident: str, bcra_data: Dict, response_text: str, situacion: int, status: str = "success"):
     try:
-        data = {
-            "identificacion": identificacion,
-            "last_situation": situacion,
-            "last_check_at": datetime.utcnow().isoformat()
-        }
-        supabase.table("users").upsert(data, on_conflict="identificacion").execute()
-        print(f"✅ Saved/Updated consultation for {identificacion} → situation {situacion}")
+        supabase.table("bcra_reports").upsert({
+            "identificacion": ident,
+            "full_data": bcra_data,
+            "response_text": response_text,
+            "situacion": situacion,
+            "status": status,
+            "created_at": datetime.utcnow().isoformat()
+        }).execute()
+        print(f"✅ Saved report for {ident} — status: {status}")
     except Exception as e:
-        print(f"❌ Supabase save error: {e}")
+        print(f"Supabase save error: {e}")
+
+# ==================== BACKGROUND PROCESSOR ====================
+async def process_bcra_lookup(ident: str):
+    situacion = 0
+    response_text = ""
+    final_status = "error"
+
+    for attempt in range(5):
+        bcra_data = await get_bcra_data(ident)
+
+        if bcra_data.get("status") == "success":
+            try:
+                periodos = bcra_data["deudas"].get("results", {}).get("periodos", [])
+                if periodos:
+                    entidades = periodos[0].get("entidades", [])
+                    if entidades:
+                        situacion = int(entidades[0].get("situacion", 0))
+            except Exception:
+                pass
+
+            if situacion == 1:
+                response_text = f"""🇦🇷 ¡Excelente noticia, che! 
+
+Tu situación en el BCRA es **1** — estás completamente al día y todo en orden. 👍
+
+Esto significa que pagás todo puntualmente y no tenés ninguna mora reportada. Los bancos te ven como un buen cliente.
+
+**Consejos de tu boga para mantenerte en esta zona:**
+1. Seguís así: mantené los pagos al día.
+2. Revisá mensualmente (el BCRA se actualiza todos los meses).
+3. Si querés crecer tu crédito, podés pedir tarjetas o préstamos con mejores tasas.
+
+¿Querés que te avise gratis el mes que viene cuando el BCRA actualice tu situación?"""
+            elif situacion in (2, 3):
+                response_text = f"""🇦🇷 Che, tu situación actual es **{situacion}**.
+
+Esto significa que tenés alguna mora reportada, pero todavía no es crítica. Los bancos la miran con atención.
+
+**Próximos pasos recomendados:**
+1. Ver exactamente qué entidad te reportó.
+2. Negociar o regularizar esa deuda lo antes posible.
+3. Una vez pagada, pedir el levantamiento (tienen 10 días hábiles)."""
+            else:
+                response_text = f"""🇦🇷 Mirá, tu situación es **{situacion}** — la cosa está complicada.
+
+Esto suele significar atrasos importantes o deuda en alto riesgo. No te asustes, pero hay que actuar.
+
+**Qué te recomiendo hacer:**
+1. Identificar exactamente qué deudas te tienen en esta situación.
+2. Negociar con la entidad.
+3. Una vez acordado el pago, pedir el certificado de libre deuda."""
+
+            final_status = "success"
+            await save_report(ident, bcra_data, response_text, situacion, "success")
+            return
+
+        elif bcra_data.get("status") == "no_history":
+            response_text = """Tranca, no tenés deudas reportadas (Situación 0). 
+Sos un "fantasma" para el sistema financiero todavía. 
+
+¿Querés tips rápidos para construir historial positivo?"""
+            await save_report(ident, bcra_data, response_text, 0, "success")
+            return
+
+        await asyncio.sleep(8)
+
+    # Fallback
+    response_text = """El BCRA sigue lento hoy. Ya guardé tu consulta y sigo intentando en segundo plano. Te aviso apenas tenga tu situación."""
+    await save_report(ident, {}, response_text, 0, "error")
 
 # ==================== REQUEST MODEL ====================
 class ChatRequest(BaseModel):
     identificacion: str
     channel: str = "web"
 
-# ==================== WEB CHAT ENDPOINT ====================
+# ==================== CHAT ENDPOINT ====================
 @app.post("/chat")
-async def chat(req: ChatRequest):
+async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
     try:
         ident = normalize_identificacion(req.identificacion)
     except ValueError as e:
-        return {"response": "El DNI o CUIT debe tener 8 u 11 dígitos. Probá de nuevo sin puntos ni guiones."}
+        raise HTTPException(status_code=400, detail=str(e))
 
-    bcra_data = await get_bcra_data(ident)
+    background_tasks.add_task(process_bcra_lookup, ident)
 
-    situacion = 0
-    if bcra_data.get("status") == "success":
-        try:
-            periodos = bcra_data["deudas"].get("results", {}).get("periodos", [])
-            if periodos:
-                entidades = periodos[0].get("entidades", [])
-                if entidades:
-                    situacion = int(entidades[0].get("situacion", 0))
-        except Exception:
-            pass
+    return {"status": "processing", "identificacion": ident}
 
-    if bcra_data.get("status") == "success":
-        await save_consultation(ident, situacion)
-
-    # BOGA RESPONSES (same as before)
-    if bcra_data.get("status") == "success":
-        if situacion == 1:
-            response_text = f"""🇦🇷 ¡Excelente noticia, che! 
-
-Tu situación en el BCRA es **1** — estás completamente al día y todo en orden. 👍
-
-Esto significa que pagás todo puntualmente y no tenés ninguna mora reportada.
-
-**Consejos de tu boga:**
-1. Mantené los pagos al día.
-2. Revisá mensualmente.
-3. Si querés crecer, podés pedir mejores tasas.
-
-¿Querés que te avise gratis el mes que viene?"""
-        elif situacion in (2, 3):
-            response_text = f"""🇦🇷 Che, tu situación actual es **{situacion}**.
-
-Tenés alguna mora, pero no es crítica.
-
-**Próximos pasos:**
-1. Ver qué entidad te reportó.
-2. Negociar o regularizar.
-3. Pedir levantamiento una vez pagada.
-
-¿Querés un plan personalizado?"""
-        else:
-            response_text = f"""🇦🇷 Mirá, tu situación es **{situacion}** — la cosa está complicada.
-
-No te asustes, pero hay que actuar rápido.
-
-¿Querés que te arme un plan concreto?"""
-    elif bcra_data.get("status") == "no_history":
-        response_text = """Tranca, no tenés deudas reportadas (Situación 0). 
-
-¿Querés tips para construir historial?"""
-    else:
-        response_text = """El sistema del BCRA está temporalmente inestable (pasa bastante seguido). 
-Ya me estoy ocupando — probá de nuevo en 10-15 segundos."""
-
-    return {
-        "response": response_text,
-        "situacion": situacion,
-        "bcra_status": bcra_data.get("status"),
-        "identificacion": ident
-    }
-
-# ==================== WHATSAPP WEBHOOK ====================
-@app.get("/webhook")
-async def verify_webhook(request: Request):
-    mode = request.query_params.get("hub.mode")
-    token = request.query_params.get("hub.verify_token")
-    challenge = request.query_params.get("hub.challenge")
-    if mode == "subscribe" and token == VERIFY_TOKEN:
-        print("✅ WhatsApp webhook verified")
-        return challenge
-    raise HTTPException(status_code=403, detail="Verification failed")
-
-@app.post("/webhook")
-async def whatsapp_webhook(request: Request):
-    data = await request.json()
+# ==================== STATUS POLLING ====================
+@app.get("/status/{identificacion}")
+async def get_status(identificacion: str):
     try:
-        entry = data["entry"][0]["changes"][0]["value"]
-        if "messages" in entry:
-            message = entry["messages"][0]
-            from_number = message["from"]
-            print(f"📨 WhatsApp message from {from_number}")
-            await send_welcome_buttons(from_number)
-    except Exception as e:
-        print(f"WhatsApp error: {e}")
-    return {"status": "ok"}
+        ident = normalize_identificacion(identificacion)
+        result = supabase.table("bcra_reports").select("*")\
+            .eq("identificacion", ident).order("created_at", desc=True).limit(1).execute()
+        if not result.data:
+            return {"status": "processing"}
+        row = result.data[0]
+        if row["status"] == "success":
+            return {"status": "ready", "response": row["response_text"]}
+        return {"status": "processing"}
+    except Exception:
+        return {"status": "error", "message": "Error interno"}
 
-async def send_welcome_buttons(to_number: str):
-    url = f"https://graph.facebook.com/v20.0/{PHONE_NUMBER_ID}/messages"
-    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to_number,
-        "type": "interactive",
-        "interactive": {
-            "type": "button",
-            "body": {"text": "🇦🇷 Bienvenido a miboga, tu boga digital para el BCRA.\n¿Qué querés hacer?"},
-            "action": {
-                "buttons": [
-                    {"type": "reply", "reply": {"id": "btn_consultar", "title": "Consultar mi situación"}},
-                    {"type": "reply", "reply": {"id": "btn_bcra", "title": "¿Qué es el BCRA?"}},
-                    {"type": "reply", "reply": {"id": "btn_salir", "title": "Cómo salir del Veraz"}}
-                ]
-            }
-        }
-    }
-    async with httpx.AsyncClient() as client:
-        await client.post(url, json=payload, headers=headers)
+# ==================== REPORT PAGE ====================
+@app.get("/report/{identificacion}")
+async def report_page(identificacion: str):
+    try:
+        ident = normalize_identificacion(identificacion)
+        result = supabase.table("bcra_reports").select("*")\
+            .eq("identificacion", ident).order("created_at", desc=True).limit(1).execute()
+        if not result.data or result.data[0]["status"] != "success":
+            return {"message": "Reporte aún en proceso. Refrescá en unos segundos."}
+        row = result.data[0]
+        html = f"""
+        <!DOCTYPE html>
+        <html lang="es">
+        <head><meta charset="UTF-8"><title>Tu reporte BCRA - miboga</title>
+        <script src="https://cdn.tailwindcss.com"></script></head>
+        <body class="bg-slate-50">
+        <div class="max-w-3xl mx-auto px-6 py-12">
+            <h1 class="text-4xl font-bold text-center mb-8">🇦🇷 Tu reporte BCRA</h1>
+            <div class="bg-white rounded-3xl shadow-xl p-8">
+                <div class="text-lg leading-relaxed">{row["response_text"]}</div>
+                <div class="mt-10 text-sm border-t pt-6">
+                    <p class="font-mono">ID: {ident}</p>
+                    <p class="mt-4 text-emerald-600">Guardado • {row.get('created_at','')[:10]}</p>
+                </div>
+            </div>
+        </div>
+        </body></html>
+        """
+        return html
+    except Exception:
+        return "<h1>Algo salió mal. Probá de nuevo.</h1>"
 
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
+@app.get("/")
+async def root():
+    return {"app": "miboga", "status": "running"}
+
+print("🚀 miboga backend with background tasks loaded")

@@ -5,8 +5,8 @@ from datetime import datetime
 from typing import Dict
 
 import httpx
-from fastapi import FastAPI, HTTPException, BackgroundTasks
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
+from fastapi.responses import HTMLResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from supabase import create_client, Client
@@ -15,6 +15,7 @@ from supabase import create_client, Client
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 APP_URL = os.getenv("APP_URL", "https://jubilant-octo-happiness.onrender.com")
+WHATSAPP_VERIFY_TOKEN = "miboga2026"   # ← You set this in Meta dashboard
 
 app = FastAPI(title="miboga - Tu boga digital para el BCRA")
 
@@ -64,17 +65,11 @@ async def get_bcra_data(identificacion: str) -> Dict:
             "cheques": cheques,
             "timestamp": datetime.utcnow().isoformat()
         }
-    except httpx.HTTPStatusError as e:
-        print(f"BCRA HTTP {e.response.status_code} for {identificacion}")
-        if e.response.status_code == 404:
-            return {"status": "no_history", "message": "No existe historial crediticio aún"}
-        return {"status": "error", "message": f"HTTP {e.response.status_code}"}
-    except httpx.TimeoutException:
-        print("BCRA timeout")
-        return {"status": "bcra_down", "message": "Timeout - BCRA lento"}
-    except Exception as e:
+    except Exception as e:  # simplified for stability
         print(f"BCRA error: {str(e)}")
-        return {"status": "error", "message": str(e)}
+        if isinstance(e, httpx.HTTPStatusError) and e.response.status_code == 404:
+            return {"status": "no_history"}
+        return {"status": "error"}
 
 # ==================== SAVE TO SUPABASE ====================
 async def save_report(ident: str, bcra_data: Dict, response_text: str, situacion: int, status: str = "success"):
@@ -87,11 +82,11 @@ async def save_report(ident: str, bcra_data: Dict, response_text: str, situacion
             "status": status,
             "created_at": datetime.utcnow().isoformat()
         }).execute()
-        print(f"✅ Saved report for {ident} — status: {status}")
+        print(f"✅ Saved report for {ident}")
     except Exception as e:
         print(f"Supabase save error: {e}")
 
-# ==================== BACKGROUND PROCESSOR ====================
+# ==================== BACKGROUND PROCESSOR (shared by web + WhatsApp) ====================
 async def process_bcra_lookup(ident: str):
     situacion = 0
     response_text = ""
@@ -109,53 +104,54 @@ async def process_bcra_lookup(ident: str):
             except Exception:
                 pass
 
+            # Updated boga responses with roadmap links (from attached document)
             if situacion == 1:
                 response_text = """🇦🇷 ¡Excelente noticia, che! 
 
-Tu situación en el BCRA es **1** — estás completamente al día y todo en orden. 👍
+Tu situación en el BCRA es **1** — estás completamente al día.
 
-Esto significa que pagás todo puntualmente y no tenés ninguna mora reportada. Los bancos te ven como un buen cliente.
+**Consejos de tu boga:**
+1. Mantené los pagos al día.
+2. Revisá mensualmente.
+3. Querés crecer tu crédito? Mirá la guía para aprovechar tu Situación 1 → https://jubilant-octo-happiness.onrender.com/guias/situacion-1"""
 
-**Consejos de tu boga para mantenerte en esta zona:**
-1. Seguís así: mantené los pagos al día.
-2. Revisá mensualmente (el BCRA se actualiza todos los meses).
-3. Si querés crecer tu crédito, podés pedir tarjetas o préstamos con mejores tasas.
-
-¿Querés que te avise gratis el mes que viene cuando el BCRA actualice tu situación?"""
             elif situacion in (2, 3):
-                response_text = f"""🇦🇷 Che, tu situación actual es **{situacion}**.
+                response_text = f"""🇦🇷 Che, tu situación actual es **{situacion}** (alerta media).
 
-Esto significa que tenés alguna mora reportada, pero todavía no es crítica. Los bancos la miran con atención.
+Hay mora reportada. No es grave, pero hay que actuar.
 
-**Próximos pasos recomendados:**
-1. Ver exactamente qué entidad te reportó.
-2. Negociar o regularizar esa deuda lo antes posible.
-3. Una vez pagada, pedir el levantamiento (tienen 10 días hábiles)."""
-            else:
-                response_text = f"""🇦🇷 Mirá, tu situación es **{situacion}** — la cosa está complicada.
+**Próximos pasos:**
+1. Ver qué entidad te reportó.
+2. Negociar o pagar.
+3. Pedir levantamiento.
+Leé la guía completa para salir de Situación 2/3 → https://jubilant-octo-happiness.onrender.com/guias/situacion-2-3"""
 
-Esto suele significar atrasos importantes o deuda en alto riesgo. No te asustes, pero hay que actuar.
+            else:  # 4 or 5
+                response_text = f"""🇦🇷 Mirá, tu situación es **{situacion}** — está complicada.
 
-**Qué te recomiendo hacer:**
-1. Identificar exactamente qué deudas te tienen en esta situación.
-2. Negociar con la entidad.
-3. Una vez acordado el pago, pedir el certificado de libre deuda."""
+No te asustes. La ley te protege (Derecho al Olvido después de 5 años).
+
+**Qué hacer:**
+1. Identificar las deudas.
+2. Negociar.
+3. Leé tus derechos y cómo salir → https://jubilant-octo-happiness.onrender.com/guias/situacion-4-5"""
 
             await save_report(ident, bcra_data, response_text, situacion, "success")
             return
 
         elif bcra_data.get("status") == "no_history":
             response_text = """Tranca, no tenés deudas reportadas (Situación 0). 
-Sos un "fantasma" para el sistema financiero todavía. 
+Sos "invisible" todavía. 
 
-¿Querés tips rápidos para construir historial positivo?"""
+Esto es bueno, pero para pedir crédito te conviene construir historial.
+Leé la guía para dejar de ser invisible → https://jubilant-octo-happiness.onrender.com/guias/situacion-0"""
             await save_report(ident, bcra_data, response_text, 0, "success")
             return
 
         await asyncio.sleep(8)
 
-    # Fallback after all retries
-    response_text = """El BCRA sigue lento hoy. Ya guardé tu consulta y sigo intentando en segundo plano. Te aviso apenas tenga tu situación."""
+    # Final fallback
+    response_text = """El BCRA sigue lento. Ya guardé tu consulta y sigo intentando. Te aviso apenas tenga tu situación."""
     await save_report(ident, {}, response_text, 0, "error")
 
 # ==================== REQUEST MODEL ====================
@@ -163,7 +159,7 @@ class ChatRequest(BaseModel):
     identificacion: str
     channel: str = "web"
 
-# ==================== API ENDPOINTS ====================
+# ==================== WEB ENDPOINTS ====================
 @app.post("/chat")
 async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
     try:
@@ -197,11 +193,7 @@ async def report_page(identificacion: str):
             .eq("identificacion", ident).order("created_at", desc=True).limit(1).execute()
         
         if not result.data or result.data[0]["status"] != "success":
-            return HTMLResponse("""
-                <h1 style="text-align:center; padding:50px; font-family:sans-serif;">
-                    Reporte aún en proceso.<br>Refrescá la página en unos segundos.
-                </h1>
-            """)
+            return HTMLResponse("<h1 style='text-align:center;padding:50px;'>Reporte aún en proceso.<br>Refrescá en unos segundos.</h1>")
         
         row = result.data[0]
         html = f"""<!DOCTYPE html>
@@ -228,7 +220,33 @@ async def report_page(identificacion: str):
     except Exception:
         return HTMLResponse("<h1>Algo salió mal. Probá de nuevo.</h1>")
 
-# ==================== SERVE index.html AT ROOT ====================
+# ==================== WHATSAPP WEBHOOK ====================
+@app.get("/webhook")
+async def verify_webhook(mode: str = None, token: str = None, challenge: str = None):
+    if mode == "subscribe" and token == WHATSAPP_VERIFY_TOKEN:
+        return PlainTextResponse(challenge)
+    raise HTTPException(status_code=403, detail="Invalid token")
+
+@app.post("/webhook")
+async def whatsapp_webhook(request: Request, background_tasks: BackgroundTasks):
+    try:
+        body = await request.json()
+        entry = body["entry"][0]["changes"][0]["value"]
+        if "messages" in entry:
+            message = entry["messages"][0]
+            phone = message["from"]
+            text = message.get("text", {}).get("body", "").strip()
+            try:
+                ident = normalize_identificacion(text)
+                background_tasks.add_task(process_bcra_lookup, ident)
+                print(f"✅ WhatsApp from {phone} → {ident}")
+            except ValueError:
+                print(f"WhatsApp from {phone} → no valid DNI/CUIT")
+    except Exception as e:
+        print(f"Webhook error: {e}")
+    return {"status": "received"}
+
+# ==================== SERVE index.html ====================
 app.mount("/", StaticFiles(directory=".", html=True), name="static")
 
-print("🚀 miboga backend with FIXED report page loaded")
+print("🚀 miboga FULL LOOP ready (web + WhatsApp + updated roadmap)")
